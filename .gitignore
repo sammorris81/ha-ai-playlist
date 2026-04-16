@@ -5,6 +5,7 @@ dist/
 build/
 .eggs/
 *.egg
+deep-dive/
 
 # IDE
 .vscode/
