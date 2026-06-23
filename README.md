@@ -10,7 +10,7 @@ Full disclosure, although this was originally a set of scripts, automations and 
 
 ## Prerequisites
 
-- **Home Assistant 2025.8+** (required for AI Task integration)
+- **Home Assistant 2025.11+** (AI Task requires 2025.8; config-flow reconfigure uses APIs added in 2025.11)
 - **[Music Assistant](https://music-assistant.io/)** integration installed and configured
 - **An AI Task entity** — configure an AI integration (e.g., Anthropic, OpenAI, Ollama) and enable its AI Task sub-entry
 

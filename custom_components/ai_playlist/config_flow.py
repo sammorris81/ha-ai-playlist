@@ -49,7 +49,7 @@ class AiPlaylistConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_AI_ENTITY] = "no_ai_entity"
             else:
                 await self.async_set_unique_id(DOMAIN)
-                self._abort_if_unique_id_configured()
+                self._abort_if_unique_id_configured(reload_on_update=False)
                 return self.async_create_entry(
                     title="AI Playlist",
                     data={CONF_AI_ENTITY: ai_entity},
@@ -77,7 +77,10 @@ class AiPlaylistConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ai_entity:
                 errors[CONF_AI_ENTITY] = "no_ai_entity"
             else:
-                return self.async_update_reload_and_abort(
+                # Update only; the entry's update listener (see __init__.py)
+                # performs the reload. Using the reloading variant here would
+                # double-reload and is deprecated in HA 2026.12 (issue #4).
+                return self.async_update_and_abort(
                     entry,
                     data={**entry.data, CONF_AI_ENTITY: ai_entity},
                 )

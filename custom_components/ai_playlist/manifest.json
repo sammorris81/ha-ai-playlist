@@ -10,5 +10,5 @@
   "issue_tracker": "https://github.com/rjbutler/ha-ai-playlist/issues",
   "loggers": ["custom_components.ai_playlist"],
   "requirements": [],
-  "version": "0.5.0b1"
+  "version": "0.5.0b2"
 }
