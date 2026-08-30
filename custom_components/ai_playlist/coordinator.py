@@ -1,8 +1,12 @@
 """Playlist coordinator — manages the lifecycle of one active playlist session."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import time
+
+import httpx
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
@@ -35,6 +39,13 @@ from .track_processing import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long to back off after a failed AI generation before retrying.
+_FAILURE_COOLDOWN_SECONDS = 300.0
+# Consecutive plays of tracks we didn't enqueue ourselves before we treat the
+# queue as taken over (e.g. by Music Assistant's per-player Autoplay/flow mode)
+# and force a full replace instead of waiting on the normal threshold.
+_UNTRACKED_STREAK_REFILL_THRESHOLD = 2
+
 
 async def generate_tracks(
     hass: HomeAssistant,
@@ -60,6 +71,8 @@ async def generate_tracks(
 
     parts = [playlist_config.get("prompt", ""), f"\nGenerate {track_count} tracks."]
     exclusion = [*history, *enqueued]
+    if len(exclusion) > 20:
+        exclusion = exclusion[-20:]
     if exclusion:
         parts.append("\nDo not include any of these tracks:\n" + "\n".join(exclusion))
     user_prompt = "\n".join(parts)
@@ -68,21 +81,67 @@ async def generate_tracks(
     if exclude_live:
         effective_system_prompt += f"\n\n{EXCLUDE_LIVE_DIRECTIVE}"
 
-    try:
-        response = await hass.services.async_call(
-            "ai_task",
-            "generate_data",
-            {
-                "task_name": "ai_playlist_generate",
-                "instructions": f"{effective_system_prompt}\n\n{user_prompt}",
-                "entity_id": ai_entity_id,
-            },
-            blocking=True,
-            return_response=True,
-        )
-    except Exception as err:
-        _LOGGER.exception("AI generation failed for '%s'", playlist_name)
-        raise HomeAssistantError(f"AI generation failed: {err}") from err
+    max_retries = 3
+    retry_delay = 10
+    response = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = await hass.services.async_call(
+                "ai_task",
+                "generate_data",
+                {
+                    "task_name": "ai_playlist_generate",
+                    "instructions": f"{effective_system_prompt}\n\n{user_prompt}",
+                    "entity_id": ai_entity_id,
+                },
+                blocking=True,
+                return_response=True,
+            )
+            break
+        except Exception as err:
+            err_msg = str(err)
+            err_msg_lower = err_msg.lower()
+            is_transient = isinstance(err, httpx.TransportError) or any(
+                msg in err_msg_lower
+                for msg in (
+                    "spikes in demand",
+                    "high demand",
+                    "rate limit",
+                    "429",
+                    "503",
+                    "resourceexhausted",
+                    "service unavailable",
+                    "quota exceeded",
+                    "temporarily unavailable",
+                )
+            )
+            if is_transient and attempt < max_retries:
+                # Attempt to parse specific retry delay from the Gemini error
+                match = re.search(r"[Pp]lease retry in ([0-9.]+)s", err_msg)
+                if match:
+                    parsed_delay = float(match.group(1)) + 1.0
+                    if parsed_delay <= 90.0:
+                        delay = parsed_delay
+                    else:
+                        _LOGGER.exception("AI generation failed for '%s' (quota exceeded delay is too long: %.1fs)", playlist_name, parsed_delay)
+                        raise HomeAssistantError(f"AI generation failed: {err}") from err
+                else:
+                    delay = retry_delay * (2 ** attempt)
+
+                _LOGGER.warning(
+                    "AI generation failed due to high demand/rate limit for '%s'. "
+                    "Retrying in %.1f seconds (attempt %d/%d). Error: %s",
+                    playlist_name,
+                    delay,
+                    attempt + 1,
+                    max_retries,
+                    err,
+                )
+                await asyncio.sleep(delay)
+            else:
+                _LOGGER.exception("AI generation failed for '%s'", playlist_name)
+                raise HomeAssistantError(f"AI generation failed: {err}") from err
 
     raw_data = None
     if isinstance(response, dict):
@@ -166,6 +225,9 @@ class PlaylistCoordinator:
         self._last_internal_queue_clear: float = 0.0
         self._initial_enqueue_count: int = 0
         self._queue_id: str | None = None
+        self._last_failure_time: float = 0.0
+        self._consecutive_failures: int = 0
+        self._untracked_play_streak: int = 0
 
     @property
     def track_count(self) -> int:
@@ -226,6 +288,38 @@ class PlaylistCoordinator:
                     await self._enqueue_tracks(cached_dicts, clear_first=clear_queue)
             else:
                 await self._generate_and_enqueue(count, clear_first=clear_queue)
+
+            # Reset to a known-clean playback mode after (re)building the
+            # queue. Music Assistant's "replace" enqueue carries over the
+            # previous queue's repeat/shuffle state, so resetting *before*
+            # the replace gets silently clobbered the moment the new queue is
+            # created — start_sound resets repeat/shuffle after its own
+            # replace call for the same reason. Without this, a repeat/
+            # shuffle setting left over from whatever played here before
+            # looks identical to a user manually enabling it mid-session —
+            # which _async_handle_queue_update treats as a signal to detach —
+            # so a stale "repeat: one" would otherwise either falsely trigger
+            # detach or silently stick the queue on one track forever.
+            try:
+                await self.hass.services.async_call(
+                    "media_player",
+                    "repeat_set",
+                    {"repeat": "off"},
+                    target={"entity_id": self.entity_id},
+                    blocking=True,
+                )
+                await self.hass.services.async_call(
+                    "media_player",
+                    "shuffle_set",
+                    {"shuffle": False},
+                    target={"entity_id": self.entity_id},
+                    blocking=True,
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Could not reset repeat/shuffle for '%s' on %s: %s",
+                    self.playlist_name, self.entity_id, err,
+                )
         finally:
             self._generating = False
 
@@ -314,7 +408,7 @@ class PlaylistCoordinator:
         items = data.get("items", -1)
         if items == 0:
             since_internal_clear = time.monotonic() - self._last_internal_queue_clear
-            if since_internal_clear < 5.0:
+            if since_internal_clear < 15.0:
                 _LOGGER.debug(
                     "Ignoring queue items=0 event for %s (%.1fs after internal clear)",
                     self.entity_id,
@@ -329,8 +423,8 @@ class PlaylistCoordinator:
 
     async def _generate_and_enqueue(
         self, track_count: int, clear_first: bool
-    ) -> None:
-        """Generate tracks via AI and enqueue them."""
+    ) -> bool:
+        """Generate tracks via AI and enqueue them. Returns True on success."""
         from homeassistant.exceptions import HomeAssistantError
 
         self.state = STATE_GENERATING
@@ -349,36 +443,46 @@ class PlaylistCoordinator:
                 enqueued=self.enqueued_tracks,
                 track_count=track_count,
             )
-        except HomeAssistantError:
+        except HomeAssistantError as err:
             self.state = STATE_ERROR
-            return
+            self._consecutive_failures += 1
+            self._last_failure_time = time.monotonic()
+            _LOGGER.warning(
+                "Refill failed for '%s' on %s (%d consecutive failure%s) — "
+                "backing off %.0fs before retrying: %s",
+                self.playlist_name,
+                self.entity_id,
+                self._consecutive_failures,
+                "" if self._consecutive_failures == 1 else "s",
+                _FAILURE_COOLDOWN_SECONDS,
+                err,
+            )
+            return False
 
         await self._enqueue_tracks(valid_dicts, clear_first=clear_first)
+        self._consecutive_failures = 0
+        return True
 
     async def _enqueue_tracks(self, tracks: list[dict], clear_first: bool) -> None:
-        """Enqueue tracks to Music Assistant."""
+        """Enqueue tracks to Music Assistant.
+
+        When clear_first is set, the first successfully-resolved track is sent
+        as "replace" (clears the queue and starts playback) and the rest as
+        "add". If the track picked for "replace" fails to resolve in the
+        library, retry "replace" on the next track instead of falling through
+        to "add" — "add" onto an already-cleared, non-playing queue just
+        stalls playback with nothing ever told to start.
+        """
         self.state = STATE_ENQUEUING
 
-        # When we issue a "replace" enqueue, MA clears the queue first.
-        # That clear emits a QUEUE_UPDATED event with items=0 which can
-        # arrive after we've returned to STATE_PLAYING; without this
-        # marker, _async_handle_queue_update would treat it as an
-        # external clear and detach. The grace window is checked there.
-        if clear_first:
-            self._last_internal_queue_clear = time.monotonic()
-
-        player_state = self.hass.states.get(self.entity_id)
-        is_playing = player_state and player_state.state == "playing"
-
-        for i, track in enumerate(tracks):
+        enqueued_count = 0
+        replace_done = not clear_first
+        for track in tracks:
             artist = track["artist"]
             title = track["title"]
             album = track.get("album", "")
 
-            if clear_first and i == 0:
-                enqueue = "replace"
-            else:
-                enqueue = "add"
+            enqueue = "add" if replace_done else "replace"
 
             try:
                 await self.hass.services.async_call(
@@ -395,8 +499,44 @@ class PlaylistCoordinator:
                     blocking=True,
                 )
                 self.enqueued_tracks.append(track_dict_to_string(track))
-            except Exception:
-                _LOGGER.warning("Failed to enqueue track: %s - %s", artist, title)
+                enqueued_count += 1
+                if enqueue == "replace":
+                    replace_done = True
+            except Exception as err:
+                _LOGGER.warning(
+                    "Failed to enqueue track '%s - %s' for '%s' on %s "
+                    "(enqueue=%s): %s",
+                    artist, title, self.playlist_name, self.entity_id,
+                    enqueue, err,
+                )
+
+        if clear_first and not replace_done:
+            _LOGGER.error(
+                "Every track failed to resolve for the initial 'replace' on "
+                "'%s' (%s) — the queue was cleared but nothing could be "
+                "started; playback is now stopped",
+                self.playlist_name,
+                self.entity_id,
+            )
+
+        _LOGGER.info(
+            "Enqueued %d/%d tracks for '%s' on %s (mode=%s)",
+            enqueued_count,
+            len(tracks),
+            self.playlist_name,
+            self.entity_id,
+            "replace" if clear_first else "add",
+        )
+
+        # When we issue a "replace" enqueue, MA clears the queue first.
+        # That clear emits a QUEUE_UPDATED event with items=0 which can
+        # arrive after we've returned to STATE_PLAYING; without this
+        # marker, _async_handle_queue_update would treat it as an
+        # external clear and detach. The grace window is checked there.
+        # Set this AFTER enqueuing is complete so the grace period doesn't
+        # get consumed by slow sequential service calls.
+        if clear_first:
+            self._last_internal_queue_clear = time.monotonic()
 
     async def _check_queue_depth(self) -> tuple[int, int]:
         """Get queue item count and current index from Music Assistant."""
@@ -409,8 +549,8 @@ class PlaylistCoordinator:
                 blocking=True,
                 return_response=True,
             )
-        except Exception:
-            _LOGGER.warning("Failed to get queue for %s", self.entity_id)
+        except Exception as err:
+            _LOGGER.warning("Failed to get queue for %s: %s", self.entity_id, err)
             return (0, -1)
 
         if not response or not isinstance(response, dict):
@@ -469,34 +609,127 @@ class PlaylistCoordinator:
                 track_str = f"{media_artist} - {media_title}"
                 await self.store.async_add_to_history(self.playlist_name, track_str)
 
+                # Untracked-play detection only needs to know whether this is
+                # an artist the AI playlist actually asked for — matching on
+                # the full title here was too strict (movie/album tie-in
+                # suffixes, apostrophe style, live-version wording all made a
+                # genuinely correct track look "hijacked" and triggered a
+                # spurious mid-song reclaim). Checked against the queue as it
+                # stood before removal, below.
+                from .track_processing import artist_enqueued, tracks_match
+                was_enqueued = artist_enqueued(media_artist, self.enqueued_tracks)
+
+                # Remove from enqueued_tracks as it has started playing —
+                # this bookkeeping (refill exclusion, cache-on-detach) still
+                # needs the precise title match, not the loose artist check.
+                self.enqueued_tracks = [
+                    t for t in self.enqueued_tracks
+                    if not tracks_match(t, track_str)
+                ]
+
+                if was_enqueued:
+                    self._untracked_play_streak = 0
+                else:
+                    self._untracked_play_streak += 1
+                    _LOGGER.warning(
+                        "'%s' is playing on %s but AI Playlist never enqueued "
+                        "it for '%s' (%d untracked play%s in a row) — Music "
+                        "Assistant Autoplay/flow mode may be filling the queue "
+                        "instead of the AI generator",
+                        track_str,
+                        self.entity_id,
+                        self.playlist_name,
+                        self._untracked_play_streak,
+                        "" if self._untracked_play_streak == 1 else "s",
+                    )
+
         # Debounce queue depth checks — at most once per 5 seconds
         now = time.monotonic()
         if now - self._last_queue_check < 5.0:
             return
         self._last_queue_check = now
 
+        # Don't try refilling if we recently had a generation failure
+        if now - self._last_failure_time < _FAILURE_COOLDOWN_SECONDS:
+            _LOGGER.debug(
+                "Skipping refill check for '%s' on %s — in failure cooldown "
+                "(%.0fs remaining)",
+                self.playlist_name,
+                self.entity_id,
+                _FAILURE_COOLDOWN_SECONDS - (now - self._last_failure_time),
+            )
+            return
+
         # Check if refill needed. Require enqueued_tracks to be non-empty —
         # otherwise queue events arriving before the initial enqueue completes
         # could trigger a spurious refill.
-        if self._generating or not self.enqueued_tracks:
+        if self._generating or (not self.enqueued_tracks and self.state != STATE_PLAYING):
             return
+
+        force_reclaim = self._untracked_play_streak >= _UNTRACKED_STREAK_REFILL_THRESHOLD
         queue_items, current_index = await self._check_queue_depth()
-        if player_state == "playing" and queue_items > 0 and current_index >= 0:
-            items_after = queue_items - current_index - 1
-            if items_after < self.refill_threshold:
-                if self._generating:
-                    return
-                self._generating = True
-                try:
+        _LOGGER.debug(
+            "Queue check for '%s' on %s: items=%d, current_index=%d, tracked=%d",
+            self.playlist_name,
+            self.entity_id,
+            queue_items,
+            current_index,
+            len(self.enqueued_tracks),
+        )
+
+        if not (player_state == "playing" and queue_items > 0 and current_index >= 0):
+            return
+
+        items_after = queue_items - current_index - 1
+        if items_after < self.refill_threshold or force_reclaim:
+            if self._generating:
+                return
+            self._generating = True
+            try:
+                if force_reclaim:
+                    _LOGGER.warning(
+                        "Reclaiming queue for '%s' on %s after %d consecutive "
+                        "untracked plays — clearing and regenerating instead "
+                        "of a normal append refill",
+                        self.playlist_name,
+                        self.entity_id,
+                        self._untracked_play_streak,
+                    )
+                    await self._reclaim_queue()
+                else:
+                    _LOGGER.info(
+                        "Refill triggered for '%s' on %s: %d items left after "
+                        "current track (threshold %d)",
+                        self.playlist_name,
+                        self.entity_id,
+                        items_after,
+                        self.refill_threshold,
+                    )
                     await self._refill()
-                finally:
-                    self._generating = False
+            finally:
+                self._generating = False
 
     async def _refill(self) -> None:
         """Generate and enqueue more tracks. Caller must set _generating=True."""
         self.state = STATE_REFILLING
-        await self._generate_and_enqueue(self.track_count, clear_first=False)
-        self.state = STATE_PLAYING
+        success = await self._generate_and_enqueue(self.track_count, clear_first=False)
+        if success:
+            self.state = STATE_PLAYING
+
+    async def _reclaim_queue(self) -> None:
+        """Clear and regenerate the queue after detecting untracked playback.
+
+        Used when tracks are playing that this coordinator never enqueued —
+        most likely Music Assistant's per-player Autoplay/flow mode topping
+        off the queue on its own once it runs low. Appending behind whatever
+        Autoplay already queued wouldn't reclaim control, so this replaces
+        the queue outright with a fresh AI-generated batch.
+        """
+        self.state = STATE_REFILLING
+        self._untracked_play_streak = 0
+        success = await self._generate_and_enqueue(self.track_count, clear_first=True)
+        if success:
+            self.state = STATE_PLAYING
 
     async def async_assess_resurrection_confidence(self) -> str:
         """Check whether an active session on this player can be resurrected.

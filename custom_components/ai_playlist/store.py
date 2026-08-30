@@ -241,12 +241,11 @@ class PlaylistStore:
             return []
 
         # Filter against history
-        history_normalized = {
-            normalize_track(t) for t in data.get("tracks", []) if normalize_track(t)
-        }
+        from .track_processing import tracks_match
+        history = data.get("tracks", [])
         filtered = [
             t for t in cached
-            if normalize_track(t) and normalize_track(t) not in history_normalized
+            if not any(tracks_match(t, h) for h in history)
         ]
 
         # Clear cache after retrieval

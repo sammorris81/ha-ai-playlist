@@ -28,8 +28,8 @@ def normalize_track(track: str | None) -> str:
     # Normalize non-breaking spaces
     normalized = normalized.replace("\u00a0", " ")
 
-    # Remove quotes
-    normalized = normalized.replace('"', "").replace("'", "")
+    # Remove quotes (straight and curly/smart variants)
+    normalized = re.sub(r"[\"'‘’“”]", "", normalized)
 
     # Normalize various dash characters to simple hyphen
     normalized = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2212]", "-", normalized)
@@ -38,13 +38,14 @@ def normalize_track(track: str | None) -> str:
     normalized = re.sub(r"\s*-\s*", " - ", normalized)
 
     # Remove common trailing parenthetical/bracketed suffixes
-    normalized = re.sub(
-        r"\s*[\(\[](?:\d{4}\s+)?(?:single version|single|remastered|remaster|"
-        r"album version|album|original|live|mix|deluxe|edition)[^\)\]]*[\)\]]\s*$",
-        "",
-        normalized,
-        flags=re.IGNORECASE,
+    # Strips things like (Acoustic), [Piano Version], (Calvin Harris Mix), (1976 Version), [Overture], (+Collateral Damage)
+    suffix_pattern = (
+        r"\s*[\(\[](?:[^\)\]]*(?:version|acoustic|piano|rock|mix|remix|edit|"
+        r"live|remaster|remastered|deluxe|single|original|overture|mono|stereo|"
+        r"recording|session|performance|instrumental|vocal|acapella|co-star|"
+        r"tribute|cover|feat|featuring|theme|soundtrack)[^\)\]]*|(?:\d{4}|\+).*?)[\)\]]\s*$"
     )
+    normalized = re.sub(suffix_pattern, "", normalized, flags=re.IGNORECASE)
 
     # Replace & with and
     normalized = normalized.replace("&", "and")
@@ -291,3 +292,75 @@ def filter_tracks(
             seen_titles_in_response.add(candidate_title_norm)
 
     return {"valid": valid, "duplicates": duplicates}
+
+
+def artists_match(artist_a: str, artist_b: str) -> bool:
+    """Check if two artist strings refer to the same artist(s), tolerating spelling/list variations."""
+    norm_a = normalize_track(artist_a)
+    norm_b = normalize_track(artist_b)
+
+    if not norm_a or not norm_b:
+        return False
+
+    # Check if one is a substring of the other (handles multi-artist/spelling variations)
+    if norm_a in norm_b or norm_b in norm_a:
+        return True
+
+    # Handle split lists (e.g. "Jessie J/Ariana Grande" split by '/' or 'and' or '&')
+    parts_a = re.split(r"\s+(?:and|&)\s+|[,/]", norm_a)
+    parts_b = re.split(r"\s+(?:and|&)\s+|[,/]", norm_b)
+    if parts_a and parts_b:
+        first_a = parts_a[0].strip()
+        first_b = parts_b[0].strip()
+        if first_a and first_b and first_a == first_b:
+            return True
+
+    return False
+
+
+def tracks_match(track_a: str, track_b: str) -> bool:
+    """Check if two tracks are a match, accounting for minor artist and suffix variations."""
+    norm_a = normalize_track(track_a)
+    norm_b = normalize_track(track_b)
+    if norm_a == norm_b:
+        return True
+
+    # Split into artist and title
+    artist_a, title_a = split_track(track_a)
+    artist_b, title_b = split_track(track_b)
+
+    # Normalize titles
+    norm_title_a = normalize_track(title_a)
+    norm_title_b = normalize_track(title_b)
+
+    if norm_title_a != norm_title_b:
+        # Allow a shorter title to match a longer one that adds a movie/album
+        # tie-in suffix normalize_track's keyword list doesn't cover (e.g.
+        # "Moon River" vs 'Moon River (From "Breakfast At Tiffany's)"') —
+        # guarded by a 2+ word minimum so a short/generic title ("Love")
+        # can't spuriously match an unrelated longer title that contains it.
+        if norm_title_a and norm_title_b:
+            shorter, longer = sorted([norm_title_a, norm_title_b], key=len)
+            if not (len(shorter.split()) >= 2 and shorter in longer):
+                return False
+        else:
+            return False
+
+    # Titles match! Now compare artists.
+    return artists_match(artist_a, artist_b)
+
+
+def artist_enqueued(media_artist: str, enqueued: list[str]) -> bool:
+    """Check whether media_artist matches the artist of any enqueued track string.
+
+    Looser than tracks_match() — ignores title entirely. Used to decide whether
+    a playing track came from an artist the AI playlist actually asked for,
+    without tripping over title variations (movie/album tie-in suffixes,
+    apostrophe style, live-version wording, alternate phrasing) that don't
+    actually indicate the queue was hijacked by something else.
+    """
+    for track in enqueued:
+        artist, _ = split_track(track)
+        if artists_match(media_artist, artist):
+            return True
+    return False
